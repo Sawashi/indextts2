@@ -17,6 +17,16 @@ CAMPPLUS_REPO = "funasr/campplus"
 CAMPPLUS_REVISION = "e4b6ede7ce16997aff4ae69fbca1f0175e2afede"
 BIGVGAN_REPO = "nvidia/bigvgan_v2_22khz_80band_256x"
 BIGVGAN_REVISION = "633ff708ed5b74903e86ff1298cf4a98e921c513"
+MODEL_REVISION_MARKER = "\n".join(
+    [
+        f"{MODEL_REPO}@{MODEL_REVISION}",
+        f"{W2V_REPO}@{W2V_REVISION}",
+        f"{MASKGCT_REPO}@{MASKGCT_REVISION}",
+        f"{CAMPPLUS_REPO}@{CAMPPLUS_REVISION}",
+        f"{BIGVGAN_REPO}@{BIGVGAN_REVISION}",
+        "",
+    ]
+)
 
 
 def _token() -> str | None:
@@ -77,5 +87,7 @@ def download_models(model_dir: Path) -> None:
 
 
 if __name__ == "__main__":
-    target = Path(os.getenv("MODEL_DIR", "/app/index-tts/checkpoints")).resolve()
+    target = Path(
+        os.getenv("MODEL_DIR", "/runpod-volume/indextts2/checkpoints")
+    ).resolve()
     download_models(target)

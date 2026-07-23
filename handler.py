@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import fcntl
 import http.client
 import ipaddress
 import logging
@@ -9,6 +10,7 @@ import math
 import os
 import random
 import secrets
+import shutil
 import socket
 import ssl
 import subprocess
@@ -22,6 +24,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import numpy as np
 import runpod
 import torch
+from download_models import MODEL_REVISION_MARKER, download_models
 from indextts.infer_v2 import IndexTTS2
 
 
@@ -64,10 +67,17 @@ def _env_positive_int(name: str, default: int) -> int:
     return value
 
 
-MODEL_DIR = Path(os.getenv("MODEL_DIR", "/app/index-tts/checkpoints")).resolve()
+VOLUME_ROOT = Path("/runpod-volume")
+MODEL_ROOT = VOLUME_ROOT / "indextts2"
+DOWNLOAD_LOCK_PATH = MODEL_ROOT / ".download.lock"
+DOWNLOAD_MARKER_NAME = ".download-complete"
+MODEL_DIR = Path(
+    os.getenv("MODEL_DIR", "/runpod-volume/indextts2/checkpoints")
+).resolve()
 CONFIG_PATH = Path(
     os.getenv("CONFIG_PATH", str(MODEL_DIR / "config.yaml"))
 ).resolve()
+MODEL_DOWNLOAD_ON_START = _env_bool("MODEL_DOWNLOAD_ON_START", True)
 USE_FP16 = _env_bool("USE_FP16", True)
 USE_DEEPSPEED = _env_bool("USE_DEEPSPEED", False)
 USE_CUDA_KERNEL = _env_bool("USE_CUDA_KERNEL", False)
@@ -99,7 +109,161 @@ def _required_model_paths(model_dir: Path, config_path: Path) -> dict[str, Path]
     }
 
 
+def _model_files_ready(model_dir: Path, config_path: Path) -> bool:
+    marker = model_dir / DOWNLOAD_MARKER_NAME
+    try:
+        marker_matches = marker.read_text(encoding="ascii") == MODEL_REVISION_MARKER
+    except OSError:
+        return False
+    return marker_matches and all(
+        path.is_file() for path in _required_model_paths(model_dir, config_path).values()
+    )
+
+
+def _assert_network_volume() -> None:
+    if not VOLUME_ROOT.is_dir() or not os.path.ismount(VOLUME_ROOT):
+        raise RuntimeError(
+            "Runpod network volume is not mounted at /runpod-volume"
+        )
+    try:
+        MODEL_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=".write-test-", dir=MODEL_ROOT):
+            pass
+    except OSError as exc:
+        raise RuntimeError(
+            "Runpod network volume at /runpod-volume is not writable"
+        ) from exc
+
+
+def _publish_download(download_dir: Path) -> None:
+    stale_dir: Path | None = None
+    if MODEL_DIR.exists():
+        stale_dir = MODEL_DIR.parent / (
+            f".{MODEL_DIR.name}-incomplete-{os.getpid()}-{time.time_ns()}"
+        )
+        os.replace(MODEL_DIR, stale_dir)
+    try:
+        os.replace(download_dir, MODEL_DIR)
+    except Exception:
+        if stale_dir is not None and stale_dir.exists() and not MODEL_DIR.exists():
+            os.replace(stale_dir, MODEL_DIR)
+        raise
+    if stale_dir is not None:
+        try:
+            shutil.rmtree(stale_dir)
+        except OSError:
+            LOGGER.warning("Could not remove old checkpoint directory %s", stale_dir)
+
+
+def _recover_interrupted_downloads() -> None:
+    stale_dirs = sorted(MODEL_DIR.parent.glob(f".{MODEL_DIR.name}-incomplete-*"))
+    download_dirs = sorted(MODEL_DIR.parent.glob(f".{MODEL_DIR.name}-download-*"))
+
+    if not MODEL_DIR.exists():
+        for stale_dir in reversed(stale_dirs):
+            if _model_files_ready(stale_dir, stale_dir / "config.yaml"):
+                LOGGER.warning("Restoring interrupted checkpoint publication")
+                os.replace(stale_dir, MODEL_DIR)
+                stale_dirs.remove(stale_dir)
+                break
+
+    for orphan in [*stale_dirs, *download_dirs]:
+        try:
+            shutil.rmtree(orphan)
+            LOGGER.info("Removed interrupted model download directory %s", orphan)
+        except OSError:
+            LOGGER.warning("Could not remove orphaned model directory %s", orphan)
+
+
+def _prepare_model_files() -> None:
+    _assert_network_volume()
+    if _model_files_ready(MODEL_DIR, CONFIG_PATH):
+        LOGGER.info("Pinned model checkpoints are ready at %s", MODEL_DIR)
+        return
+
+    try:
+        lock_file = DOWNLOAD_LOCK_PATH.open("a+")
+    except OSError as exc:
+        raise RuntimeError("Could not open the model download lock") from exc
+
+    with lock_file:
+        LOGGER.info("Waiting for model download lock %s", DOWNLOAD_LOCK_PATH)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            _recover_interrupted_downloads()
+            if _model_files_ready(MODEL_DIR, CONFIG_PATH):
+                LOGGER.info("Another worker completed the model download")
+                return
+            if not MODEL_DOWNLOAD_ON_START:
+                missing = [
+                    label
+                    for label, path in _required_model_paths(
+                        MODEL_DIR, CONFIG_PATH
+                    ).items()
+                    if not path.is_file()
+                ]
+                marker = MODEL_DIR / DOWNLOAD_MARKER_NAME
+                try:
+                    marker_matches = (
+                        marker.read_text(encoding="ascii") == MODEL_REVISION_MARKER
+                    )
+                except OSError:
+                    marker_matches = False
+                if not marker_matches:
+                    missing.append(f"{DOWNLOAD_MARKER_NAME} revision marker")
+                raise RuntimeError(
+                    "Model checkpoints are incomplete and "
+                    "MODEL_DOWNLOAD_ON_START is false; missing: "
+                    + ", ".join(missing)
+                )
+
+            expected_config = (MODEL_DIR / "config.yaml").resolve()
+            if CONFIG_PATH != expected_config:
+                raise RuntimeError(
+                    "Automatic model download requires CONFIG_PATH to be "
+                    f"{expected_config}"
+                )
+
+            MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
+            download_dir = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{MODEL_DIR.name}-download-", dir=MODEL_DIR.parent
+                )
+            )
+            LOGGER.info("Downloading pinned model checkpoints to %s", download_dir)
+            try:
+                download_models(download_dir)
+                downloaded_required = _required_model_paths(
+                    download_dir, download_dir / "config.yaml"
+                )
+                missing = [
+                    label
+                    for label, path in downloaded_required.items()
+                    if not path.is_file()
+                ]
+                if missing:
+                    raise RuntimeError(
+                        "Model download completed with missing files: "
+                        + ", ".join(missing)
+                    )
+                marker = download_dir / DOWNLOAD_MARKER_NAME
+                marker.write_text(MODEL_REVISION_MARKER, encoding="ascii")
+                _publish_download(download_dir)
+            finally:
+                if download_dir.exists():
+                    shutil.rmtree(download_dir)
+
+            if not _model_files_ready(MODEL_DIR, CONFIG_PATH):
+                raise RuntimeError(
+                    "Published model checkpoints failed the completeness check"
+                )
+            LOGGER.info("Model checkpoints published at %s", MODEL_DIR)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _load_model() -> IndexTTS2:
+    _prepare_model_files()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required but no NVIDIA GPU is available")
     if USE_DEEPSPEED:

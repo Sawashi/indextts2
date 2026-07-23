@@ -8,6 +8,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 output.wav
+.local-runpod-volume/
 *.log
 .DS_Store
 Thumbs.db

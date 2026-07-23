@@ -20,10 +20,11 @@ worker protocol.
 - Python: `3.11.13`; PyTorch `2.8.*` CUDA 12.8 from IndexTTS2's `uv.lock`
 - Runpod SDK: `1.11.0`
 
-The Docker build also pins the four auxiliary model repositories in
-`download_models.py`. Updating IndexTTS2 requires reviewing its API, lock file,
-checkpoint layout, licenses, and GPU behavior before changing `INDEXTTS_REF`.
-Using mutable `main` in production is intentionally avoided.
+`download_models.py` also pins the four auxiliary model repositories. Source and
+Python dependencies are built into the image; model weights are stored on the
+attached Runpod network volume. Updating IndexTTS2 requires reviewing its API,
+lock file, checkpoint layout, licenses, and GPU behavior before changing
+`INDEXTTS_REF`. Using mutable `main` in production is intentionally avoided.
 
 ## How Voice Cloning Works
 
@@ -54,12 +55,13 @@ returns a random 32-bit seed.
 - A Runpod account with Serverless access and a Runpod API key
 - A public HTTPS speaker-audio URL, or a base64 recording
 - Docker with NVIDIA Container Toolkit for local GPU testing
-- Sufficient build time and storage for the large model image
+- A writable Runpod Serverless network volume with enough capacity for all
+  primary and auxiliary model files
 
 The native Runpod GitHub builder currently has a 30-minute Docker build-step
-limit, 160-minute total build window, and 80 GB image limit. Model downloads are
-baked into the image and may approach the build-time limit depending on network
-speed.
+limit, 160-minute total build window, and 80 GB image limit. Checkpoints are not
+downloaded during the image build, keeping the worker image smaller and model
+storage persistent across image deployments.
 
 ## GitHub Setup
 
@@ -90,17 +92,56 @@ so the Runpod build needs no token.
 6. Create a GitHub release when you want Runpod to trigger a new build; ordinary
    pushes do not automatically redeploy an existing endpoint.
 
-For a local/private Hugging Face token, BuildKit supports a secret without
-placing it in an image layer:
+Build locally with:
 
 ```bash
-docker buildx build --platform linux/amd64 \
-  --secret id=hf_token,env=HF_TOKEN \
-  -t indextts2-runpod:13495845 .
+docker buildx build --platform linux/amd64 -t indextts2-runpod:13495845 .
 ```
 
-Do not use a token as a Docker `ARG` or commit it to the repository. Runpod's
-GitHub builder does not need a token for the pinned public assets.
+Do not use a token as a Docker `ARG` or commit it to the repository. The pinned
+assets are public. If a token is required in the future, set `HF_TOKEN` as a
+Runpod endpoint environment variable so it is available only at runtime.
+
+## Attach A Network Volume
+
+1. In the Runpod console, create a network volume under **Storage** in the data
+   center where this Serverless endpoint will run. Allocate enough space for the
+   pinned IndexTTS2 model and all auxiliary models, plus room for a temporary
+   second copy during future replacement downloads.
+2. In the Serverless endpoint configuration, select that network volume. Runpod
+   mounts an attached Serverless network volume inside each worker at
+   `/runpod-volume`.
+3. Keep the default paths for automatic download:
+   `/runpod-volume/indextts2/checkpoints` and
+   `/runpod-volume/indextts2/checkpoints/config.yaml`.
+4. Confirm the worker runtime user can create files on the volume. Startup fails
+   immediately with a clear error if `/runpod-volume` is absent or not writable.
+
+Network volumes are tied to a specific Runpod data center. The endpoint can use
+only GPU types with availability in that same data center, so check GPU capacity
+before creating or attaching the volume. Moving to another data center requires
+a different volume and another first-start download.
+
+Persistent network-volume storage is billed independently of active workers and
+continues to incur storage cost when active workers are set to zero. Review
+Runpod's current storage pricing and delete volumes that are no longer needed.
+
+### First Worker Start
+
+At module startup, the worker checks the completion marker and every required
+checkpoint and verifies that the marker contains the currently pinned model
+revisions. If anything is absent or outdated and `MODEL_DOWNLOAD_ON_START=true`, one worker
+acquires `/runpod-volume/indextts2/.download.lock`, downloads all pinned assets
+into a temporary sibling directory, validates them, writes
+`.download-complete`, and atomically publishes the directory as `checkpoints`.
+Other workers wait on the filesystem lock and then reuse the completed files.
+On startup under the same lock, interrupted temporary downloads are removed and
+an interrupted publication is restored when possible.
+
+The first cold start is therefore substantially longer and depends on Hugging
+Face and network-volume throughput. Later cold starts skip downloading when the
+marker and required files exist, but still load the model from the volume into
+GPU memory. No checkpoint download occurs per request.
 
 ## Recommended Endpoint Settings
 
@@ -123,8 +164,9 @@ parallel capacity.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MODEL_DIR` | `/app/index-tts/checkpoints` | Checkpoint and auxiliary-model directory |
-| `CONFIG_PATH` | `/app/index-tts/checkpoints/config.yaml` | Official IndexTTS2 config |
+| `MODEL_DIR` | `/runpod-volume/indextts2/checkpoints` | Persistent checkpoint and auxiliary-model directory |
+| `CONFIG_PATH` | `/runpod-volume/indextts2/checkpoints/config.yaml` | Official config; automatic download requires this default layout |
+| `MODEL_DOWNLOAD_ON_START` | `true` | Download pinned checkpoints at startup when incomplete |
 | `USE_FP16` | `true` | Enable FP16 where supported |
 | `USE_DEEPSPEED` | `false` | Opt in to DeepSpeed; not installed by default |
 | `USE_CUDA_KERNEL` | `false` | Opt in to BigVGAN custom CUDA kernel; not built by default |
@@ -285,12 +327,22 @@ Build for Runpod's architecture:
 docker build --platform linux/amd64 -t indextts2-runpod:13495845 .
 ```
 
-Run the SDK's local test mode with an NVIDIA GPU:
+Create a writable directory to simulate the mounted volume. On Linux, grant it
+to the image's UID `10001`:
+
+```bash
+mkdir -p .local-runpod-volume
+sudo chown 10001:10001 .local-runpod-volume
+```
+
+Run the SDK's local test mode with an NVIDIA GPU and that directory mounted at
+the same path used by Runpod:
 
 ```bash
 docker run --rm --gpus all \
   -e RUNPOD_DEBUG_LEVEL=INFO \
   -v "$(pwd)/test_input.json:/app/index-tts/test_input.json:ro" \
+  -v "$(pwd)/.local-runpod-volume:/runpod-volume" \
   indextts2-runpod:13495845
 ```
 
@@ -309,11 +361,12 @@ file before testing. Do not use a mutable `latest` tag for production builds.
 
 ### Missing Checkpoints
 
-- Confirm `MODEL_DIR` and `CONFIG_PATH` match the baked image paths.
-- Look for a failed Hugging Face download in the Docker build logs.
-- Rebuild without stale cache after changing model revisions.
-- Do not rely on runtime downloads; the handler fails fast if any required file
-  is absent.
+- Confirm a network volume is attached at `/runpod-volume` and is writable.
+- Confirm `MODEL_DIR` and `CONFIG_PATH` match the persistent volume paths.
+- Check startup logs for Hugging Face download or volume-capacity failures.
+- Ensure the volume has room for a temporary download before atomic publication.
+- If automatic download is disabled, provision every pinned primary and
+  auxiliary file and `.download-complete` before starting the worker.
 
 ### Out Of Memory
 
@@ -325,10 +378,13 @@ file before testing. Do not use a mutable `latest` tag for production builds.
 
 ### Cold Starts
 
-The image and model are large, and initialization loads several neural networks.
-Active workers set to zero minimize idle cost but incur image-pull and model-load
-latency. Keep one active worker for latency-sensitive production traffic, and
-monitor startup time before raising scale limits.
+Initialization loads several neural networks from the attached volume. The first
+worker on a new volume must also download and atomically publish all pinned model
+assets, making that first cold start much longer. Active workers set to zero
+minimize compute cost but incur model-load latency after scale-up; volume storage
+cost continues while workers are stopped. Keep one active worker for
+latency-sensitive production traffic, and monitor startup time before raising
+scale limits.
 
 ## Production Security And Delivery
 

@@ -9,8 +9,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     UV_PYTHON=3.11.13 \
     UV_LINK_MODE=copy \
-    MODEL_DIR=/app/index-tts/checkpoints \
-    CONFIG_PATH=/app/index-tts/checkpoints/config.yaml \
+    MODEL_DIR=/runpod-volume/indextts2/checkpoints \
+    CONFIG_PATH=/runpod-volume/indextts2/checkpoints/config.yaml \
+    MODEL_DOWNLOAD_ON_START=true \
     USE_FP16=true \
     USE_DEEPSPEED=false \
     USE_CUDA_KERNEL=false \
@@ -43,14 +44,7 @@ RUN uv python install 3.11.13 \
     && uv sync --frozen --no-dev \
     && uv pip install --python .venv/bin/python -r /app/requirements.txt
 
-COPY download_models.py /app/download_models.py
-RUN --mount=type=secret,id=hf_token,required=false \
-    set -eu; \
-    if [ -f /run/secrets/hf_token ]; then export HF_TOKEN="$(cat /run/secrets/hf_token)"; fi; \
-    python /app/download_models.py; \
-    rm -rf /root/.cache/huggingface /root/.cache/uv
-
-COPY handler.py /app/index-tts/handler.py
+COPY download_models.py handler.py /app/index-tts/
 RUN useradd --create-home --uid 10001 worker \
     && mkdir -p /app/index-tts/indextts/utils/tagger_cache \
     && chown worker:worker /app/index-tts/indextts/utils/tagger_cache
