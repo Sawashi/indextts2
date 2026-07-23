@@ -1,10 +1,10 @@
 # IndexTTS2 Runpod Serverless Worker
 
 GPU queue worker for the official [IndexTTS2](https://github.com/index-tts/index-tts)
-zero-shot text-to-speech model. The model loads once at worker startup, accepts a
-temporary speaker reference recording, and returns a base64-encoded WAV file.
-There is no web UI or HTTP framework; Runpod's Python SDK supplies the queue
-worker protocol.
+zero-shot text-to-speech model. The process registers its queue handler without
+loading the model; the first request initializes it once, accepts a temporary
+speaker reference recording, and returns a base64-encoded WAV file. There is no
+web UI or HTTP framework; Runpod's Python SDK supplies the queue worker protocol.
 
 > **Voice-cloning consent warning:** Use this worker only with a speaker's
 > informed authorization or another valid legal basis. Do not impersonate,
@@ -114,7 +114,7 @@ Runpod endpoint environment variable so it is available only at runtime.
 3. Keep the default paths for automatic download:
    `/runpod-volume/indextts2/checkpoints` and
    `/runpod-volume/indextts2/checkpoints/config.yaml`.
-4. Confirm the worker runtime user can create files on the volume. Startup fails
+4. The container runs as root and performs a startup write test. Startup fails
    immediately with a clear error if `/runpod-volume` is absent or not writable.
 
 Network volumes are tied to a specific Runpod data center. The endpoint can use
@@ -128,20 +128,26 @@ Runpod's current storage pricing and delete volumes that are no longer needed.
 
 ### First Worker Start
 
-At module startup, the worker checks the completion marker and every required
-checkpoint and verifies that the marker contains the currently pinned model
-revisions. If anything is absent or outdated and `MODEL_DOWNLOAD_ON_START=true`, one worker
-acquires `/runpod-volume/indextts2/.download.lock`, downloads all pinned assets
-into a temporary sibling directory, validates them, writes
-`.download-complete`, and atomically publishes the directory as `checkpoints`.
-Other workers wait on the filesystem lock and then reuse the completed files.
-On startup under the same lock, interrupted temporary downloads are removed and
-an interrupted publication is restored when possible.
+At process startup, the worker immediately logs its UID/GID, hostname, Python,
+volume status and free space, CUDA status, GPU name, and non-secret configuration.
+It write-tests the network volume and then starts the Runpod queue handler without
+loading IndexTTS2.
 
-The first cold start is therefore substantially longer and depends on Hugging
-Face and network-volume throughput. Later cold starts skip downloading when the
-marker and required files exist, but still load the model from the volume into
-GPU memory. No checkpoint download occurs per request.
+On the first request, the worker checks the completion marker and every required
+checkpoint and verifies that the marker contains the currently pinned model
+revisions. If anything is absent or outdated and `MODEL_DOWNLOAD_ON_START=true`,
+one worker acquires `/runpod-volume/indextts2/.download.lock`, downloads all
+pinned assets into a temporary sibling directory, validates them, writes
+`.download-complete`, and atomically publishes the directory as `checkpoints`.
+Other workers wait up to `MODEL_LOCK_TIMEOUT_SECONDS` on the filesystem lock and
+then reuse the completed files. Under the same lock, interrupted temporary
+downloads are removed and an interrupted publication is restored when possible.
+
+The first request on a new worker is therefore substantially longer and depends
+on Hugging Face and network-volume throughput. Downloads use request timeouts,
+exponential-backoff retries, and periodic progress logs. Later cold starts skip
+downloading when the marker and required files exist, but still load the model
+from the volume into GPU memory. The initialized model is reused by later jobs.
 
 ## Recommended Endpoint Settings
 
@@ -151,7 +157,7 @@ GPU memory. No checkpoint download occurs per request.
 - Max workers: **1** initially
 - GPUs per worker: **1**
 - GPU: start with **24 GB VRAM or higher**
-- Execution timeout: **600 seconds**
+- Execution timeout: **3600 seconds** for the first download and model load
 - FP16: enabled (`USE_FP16=true`)
 - DeepSpeed: disabled (`USE_DEEPSPEED=false`)
 - Custom CUDA kernels: disabled (`USE_CUDA_KERNEL=false`)
@@ -166,7 +172,11 @@ parallel capacity.
 | --- | --- | --- |
 | `MODEL_DIR` | `/runpod-volume/indextts2/checkpoints` | Persistent checkpoint and auxiliary-model directory |
 | `CONFIG_PATH` | `/runpod-volume/indextts2/checkpoints/config.yaml` | Official config; automatic download requires this default layout |
-| `MODEL_DOWNLOAD_ON_START` | `true` | Download pinned checkpoints at startup when incomplete |
+| `MODEL_DOWNLOAD_ON_START` | `true` | Download pinned checkpoints during first model initialization when incomplete |
+| `MODEL_LOCK_TIMEOUT_SECONDS` | `1800` | Maximum wait for another worker's checkpoint-download lock |
+| `HF_DOWNLOAD_TIMEOUT_SECONDS` | `600` | Hugging Face metadata and file request timeout |
+| `HF_DOWNLOAD_RETRIES` | `5` | Retries after a failed Hugging Face repository download attempt |
+| `HF_DOWNLOAD_BACKOFF_SECONDS` | `5` | Initial exponential retry delay |
 | `USE_FP16` | `true` | Enable FP16 where supported |
 | `USE_DEEPSPEED` | `false` | Opt in to DeepSpeed; not installed by default |
 | `USE_CUDA_KERNEL` | `false` | Opt in to BigVGAN custom CUDA kernel; not built by default |
@@ -327,12 +337,10 @@ Build for Runpod's architecture:
 docker build --platform linux/amd64 -t indextts2-runpod:13495845 .
 ```
 
-Create a writable directory to simulate the mounted volume. On Linux, grant it
-to the image's UID `10001`:
+Create a writable directory to simulate the mounted volume:
 
 ```bash
 mkdir -p .local-runpod-volume
-sudo chown 10001:10001 .local-runpod-volume
 ```
 
 Run the SDK's local test mode with an NVIDIA GPU and that directory mounted at

@@ -12,6 +12,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MODEL_DIR=/runpod-volume/indextts2/checkpoints \
     CONFIG_PATH=/runpod-volume/indextts2/checkpoints/config.yaml \
     MODEL_DOWNLOAD_ON_START=true \
+    MODEL_LOCK_TIMEOUT_SECONDS=1800 \
+    HF_DOWNLOAD_TIMEOUT_SECONDS=600 \
+    HF_DOWNLOAD_RETRIES=5 \
+    HF_DOWNLOAD_BACKOFF_SECONDS=5 \
     USE_FP16=true \
     USE_DEEPSPEED=false \
     USE_CUDA_KERNEL=false \
@@ -45,10 +49,7 @@ RUN uv python install 3.11.13 \
     && uv pip install --python .venv/bin/python -r /app/requirements.txt
 
 COPY download_models.py handler.py /app/index-tts/
-RUN useradd --create-home --uid 10001 worker \
-    && mkdir -p /app/index-tts/indextts/utils/tagger_cache \
-    && chown worker:worker /app/index-tts/indextts/utils/tagger_cache
-USER worker
+USER root
 WORKDIR /app/index-tts
 
 CMD ["python", "-u", "handler.py"]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import fcntl
 import http.client
 import ipaddress
@@ -14,6 +15,7 @@ import shutil
 import socket
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -21,18 +23,102 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
-import numpy as np
-import runpod
-import torch
-from download_models import MODEL_REVISION_MARKER, download_models
-from indextts.infer_v2 import IndexTTS2
-
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    stream=sys.stdout,
 )
 LOGGER = logging.getLogger("indextts2-worker")
+
+
+def _startup_banner() -> None:
+    print("=== IndexTTS2 Runpod worker startup ===", flush=True)
+    get_uid = getattr(os, "getuid", lambda: "unavailable")
+    get_gid = getattr(os, "getgid", lambda: "unavailable")
+    model_dir = os.getenv("MODEL_DIR", "/runpod-volume/indextts2/checkpoints")
+    config_path = os.getenv("CONFIG_PATH", f"{model_dir}/config.yaml")
+
+    print(
+        f"uid={get_uid()} gid={get_gid()} hostname={socket.gethostname()} "
+        f"python={sys.version.replace(os.linesep, ' ')}",
+        flush=True,
+    )
+    print(f"MODEL_DIR={model_dir}", flush=True)
+    print(f"CONFIG_PATH={config_path}", flush=True)
+    print(
+        f"MODEL_DOWNLOAD_ON_START={os.getenv('MODEL_DOWNLOAD_ON_START', 'true')}",
+        flush=True,
+    )
+    print(
+        f"MODEL_LOCK_TIMEOUT_SECONDS={os.getenv('MODEL_LOCK_TIMEOUT_SECONDS', '1800')}",
+        flush=True,
+    )
+    print(
+        "HF_DOWNLOAD_TIMEOUT_SECONDS="
+        f"{os.getenv('HF_DOWNLOAD_TIMEOUT_SECONDS', '600')}",
+        flush=True,
+    )
+    print(
+        f"HF_DOWNLOAD_RETRIES={os.getenv('HF_DOWNLOAD_RETRIES', '5')}",
+        flush=True,
+    )
+    print(
+        f"HF_DOWNLOAD_BACKOFF_SECONDS={os.getenv('HF_DOWNLOAD_BACKOFF_SECONDS', '5')}",
+        flush=True,
+    )
+    print(f"HF_TOKEN present={bool(os.getenv('HF_TOKEN'))}", flush=True)
+
+    volume_path = "/runpod-volume"
+    print("Checking /runpod-volume mount and free space...", flush=True)
+    volume_exists = os.path.exists(volume_path)
+    volume_mounted = os.path.ismount(volume_path)
+    try:
+        free_bytes = shutil.disk_usage(volume_path).free if volume_exists else None
+        free_disk = (
+            f"{free_bytes} bytes ({free_bytes / (1024**3):.2f} GiB)"
+            if free_bytes is not None
+            else "unavailable"
+        )
+    except OSError as exc:
+        free_disk = f"unavailable ({type(exc).__name__})"
+    print(
+        f"/runpod-volume exists={volume_exists} ismount={volume_mounted} "
+        f"free_disk={free_disk}",
+        flush=True,
+    )
+
+    print("Loading PyTorch for CUDA diagnostics...", flush=True)
+    try:
+        import torch as torch_for_banner
+
+        cuda_available = torch_for_banner.cuda.is_available()
+        gpu_name = (
+            torch_for_banner.cuda.get_device_name(0)
+            if cuda_available
+            else "unavailable"
+        )
+        print(
+            f"torch.cuda.is_available()={cuda_available} gpu_name={gpu_name}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"PyTorch CUDA diagnostics failed: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        raise
+    print("=== Startup diagnostics complete; model loading is deferred ===", flush=True)
+
+
+_startup_banner()
+
+
+import numpy as np  # noqa: E402
+import runpod  # noqa: E402
+import torch  # noqa: E402
+from download_models import MODEL_REVISION_MARKER, download_models  # noqa: E402
+
 
 ALLOWED_EXTENSIONS = {"wav", "mp3", "flac", "m4a", "ogg"}
 EMOTION_VECTOR_SIZE = 8
@@ -74,9 +160,7 @@ DOWNLOAD_MARKER_NAME = ".download-complete"
 MODEL_DIR = Path(
     os.getenv("MODEL_DIR", "/runpod-volume/indextts2/checkpoints")
 ).resolve()
-CONFIG_PATH = Path(
-    os.getenv("CONFIG_PATH", str(MODEL_DIR / "config.yaml"))
-).resolve()
+CONFIG_PATH = Path(os.getenv("CONFIG_PATH", str(MODEL_DIR / "config.yaml"))).resolve()
 MODEL_DOWNLOAD_ON_START = _env_bool("MODEL_DOWNLOAD_ON_START", True)
 USE_FP16 = _env_bool("USE_FP16", True)
 USE_DEEPSPEED = _env_bool("USE_DEEPSPEED", False)
@@ -84,6 +168,7 @@ USE_CUDA_KERNEL = _env_bool("USE_CUDA_KERNEL", False)
 MAX_TEXT_LENGTH = _env_positive_int("MAX_TEXT_LENGTH", 5_000)
 MAX_AUDIO_BYTES = _env_positive_int("MAX_AUDIO_BYTES", 25 * 1024 * 1024)
 DOWNLOAD_TIMEOUT_SECONDS = _env_positive_int("DOWNLOAD_TIMEOUT_SECONDS", 30)
+MODEL_LOCK_TIMEOUT_SECONDS = _env_positive_int("MODEL_LOCK_TIMEOUT_SECONDS", 1_800)
 
 
 def _required_model_paths(model_dir: Path, config_path: Path) -> dict[str, Path]:
@@ -99,9 +184,7 @@ def _required_model_paths(model_dir: Path, config_path: Path) -> dict[str, Path]
         "emotion model": model_dir / "qwen0.6bemo4-merge" / "model.safetensors",
         "W2V-BERT config": cache / "w2v-bert-2.0" / "config.json",
         "W2V-BERT model": cache / "w2v-bert-2.0" / "model.safetensors",
-        "W2V-BERT preprocessor": cache
-        / "w2v-bert-2.0"
-        / "preprocessor_config.json",
+        "W2V-BERT preprocessor": cache / "w2v-bert-2.0" / "preprocessor_config.json",
         "semantic codec": cache / "semantic_codec_model.safetensors",
         "CAMPPlus": cache / "campplus_cn_common.bin",
         "BigVGAN config": cache / "bigvgan" / "config.json",
@@ -113,26 +196,103 @@ def _model_files_ready(model_dir: Path, config_path: Path) -> bool:
     marker = model_dir / DOWNLOAD_MARKER_NAME
     try:
         marker_matches = marker.read_text(encoding="ascii") == MODEL_REVISION_MARKER
-    except OSError:
+    except (OSError, UnicodeError):
         return False
     return marker_matches and all(
-        path.is_file() for path in _required_model_paths(model_dir, config_path).values()
+        path.is_file()
+        for path in _required_model_paths(model_dir, config_path).values()
     )
 
 
 def _assert_network_volume() -> None:
+    error_message = (
+        "Runpod network volume at /runpod-volume is unavailable: volume not "
+        "mounted or permissions wrong; attach volume in endpoint settings"
+    )
     if not VOLUME_ROOT.is_dir() or not os.path.ismount(VOLUME_ROOT):
-        raise RuntimeError(
-            "Runpod network volume is not mounted at /runpod-volume"
-        )
+        raise RuntimeError(error_message)
     try:
         MODEL_ROOT.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(prefix=".write-test-", dir=MODEL_ROOT):
-            pass
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=".write-test-", dir=MODEL_ROOT
+        ) as write_test:
+            write_test.write(b"runpod-volume-write-test\n")
+            write_test.flush()
+    except OSError as exc:
+        raise RuntimeError(error_message) from exc
+
+
+def _prepare_runtime_directories() -> None:
+    tagger_cache = (
+        Path(__file__).resolve().parent / "indextts" / "utils" / "tagger_cache"
+    )
+    try:
+        tagger_cache.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise RuntimeError(
-            "Runpod network volume at /runpod-volume is not writable"
+            f"Could not create runtime cache directory {tagger_cache}"
         ) from exc
+
+
+def _write_download_marker(download_dir: Path) -> None:
+    marker = download_dir / DOWNLOAD_MARKER_NAME
+    temporary_marker = download_dir / (
+        f".{DOWNLOAD_MARKER_NAME}.tmp-{os.getpid()}-{time.time_ns()}"
+    )
+    try:
+        with temporary_marker.open("w", encoding="ascii", newline="") as output:
+            output.write(MODEL_REVISION_MARKER)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_marker, marker)
+    finally:
+        try:
+            temporary_marker.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.warning("Could not remove temporary marker %s", temporary_marker)
+
+
+def _acquire_download_lock(lock_file: Any) -> None:
+    started = time.monotonic()
+    deadline = started + MODEL_LOCK_TIMEOUT_SECONDS
+    next_progress_log = started + 10
+    LOGGER.info(
+        "Waiting up to %d seconds for model download lock %s",
+        MODEL_LOCK_TIMEOUT_SECONDS,
+        DOWNLOAD_LOCK_PATH,
+    )
+    while True:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            LOGGER.info(
+                "Acquired model download lock after %.1f seconds",
+                time.monotonic() - started,
+            )
+            return
+        except BlockingIOError:
+            pass
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise RuntimeError("Could not acquire the model download lock") from exc
+
+        now = time.monotonic()
+        remaining = deadline - now
+        if remaining <= 0:
+            raise RuntimeError(
+                "Timed out after "
+                f"{MODEL_LOCK_TIMEOUT_SECONDS} seconds waiting for model download "
+                f"lock {DOWNLOAD_LOCK_PATH}; another worker may be stuck"
+            )
+        if now >= next_progress_log:
+            LOGGER.info(
+                "Still waiting for lock... path=%s elapsed_seconds=%.0f "
+                "remaining_seconds=%.0f",
+                DOWNLOAD_LOCK_PATH,
+                now - started,
+                remaining,
+            )
+            next_progress_log = now + 10
+        time.sleep(min(1.0, remaining))
 
 
 def _publish_download(download_dir: Path) -> None:
@@ -187,8 +347,7 @@ def _prepare_model_files() -> None:
         raise RuntimeError("Could not open the model download lock") from exc
 
     with lock_file:
-        LOGGER.info("Waiting for model download lock %s", DOWNLOAD_LOCK_PATH)
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        _acquire_download_lock(lock_file)
         try:
             _recover_interrupted_downloads()
             if _model_files_ready(MODEL_DIR, CONFIG_PATH):
@@ -207,14 +366,13 @@ def _prepare_model_files() -> None:
                     marker_matches = (
                         marker.read_text(encoding="ascii") == MODEL_REVISION_MARKER
                     )
-                except OSError:
+                except (OSError, UnicodeError):
                     marker_matches = False
                 if not marker_matches:
                     missing.append(f"{DOWNLOAD_MARKER_NAME} revision marker")
                 raise RuntimeError(
                     "Model checkpoints are incomplete and "
-                    "MODEL_DOWNLOAD_ON_START is false; missing: "
-                    + ", ".join(missing)
+                    "MODEL_DOWNLOAD_ON_START is false; missing: " + ", ".join(missing)
                 )
 
             expected_config = (MODEL_DIR / "config.yaml").resolve()
@@ -246,12 +404,17 @@ def _prepare_model_files() -> None:
                         "Model download completed with missing files: "
                         + ", ".join(missing)
                     )
-                marker = download_dir / DOWNLOAD_MARKER_NAME
-                marker.write_text(MODEL_REVISION_MARKER, encoding="ascii")
+                _write_download_marker(download_dir)
                 _publish_download(download_dir)
             finally:
                 if download_dir.exists():
-                    shutil.rmtree(download_dir)
+                    try:
+                        shutil.rmtree(download_dir)
+                    except OSError:
+                        LOGGER.exception(
+                            "Could not remove failed model download directory %s",
+                            download_dir,
+                        )
 
             if not _model_files_ready(MODEL_DIR, CONFIG_PATH):
                 raise RuntimeError(
@@ -262,7 +425,8 @@ def _prepare_model_files() -> None:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _load_model() -> IndexTTS2:
+def _load_model() -> Any:
+    _prepare_runtime_directories()
     _prepare_model_files()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required but no NVIDIA GPU is available")
@@ -273,6 +437,15 @@ def _load_model() -> IndexTTS2:
             raise RuntimeError(
                 "USE_DEEPSPEED is enabled but DeepSpeed is not installed correctly"
             ) from exc
+
+    LOGGER.info("Importing the IndexTTS2 inference runtime")
+    try:
+        from indextts.infer_v2 import IndexTTS2
+    except Exception:
+        LOGGER.exception("IndexTTS2 runtime import failed")
+        raise RuntimeError(
+            "IndexTTS2 runtime import failed; check worker logs"
+        ) from None
 
     required = _required_model_paths(MODEL_DIR, CONFIG_PATH)
     missing = [label for label, path in required.items() if not path.is_file()]
@@ -312,7 +485,9 @@ def _load_model() -> IndexTTS2:
         )
     except Exception:
         LOGGER.exception("IndexTTS2 initialization failed")
-        raise RuntimeError("IndexTTS2 initialization failed; check worker logs") from None
+        raise RuntimeError(
+            "IndexTTS2 initialization failed; check worker logs"
+        ) from None
     if USE_CUDA_KERNEL and not model.use_cuda_kernel:
         raise RuntimeError(
             "USE_CUDA_KERNEL is enabled but the custom CUDA kernel did not load"
@@ -321,8 +496,26 @@ def _load_model() -> IndexTTS2:
     return model
 
 
-MODEL = _load_model()
+MODEL = None
+MODEL_INIT_LOCK = threading.Lock()
 INFERENCE_LOCK = threading.Lock()
+
+
+def get_model() -> Any:
+    global MODEL
+
+    if MODEL is not None:
+        return MODEL
+    with MODEL_INIT_LOCK:
+        if MODEL is None:
+            started = time.monotonic()
+            LOGGER.info("Starting lazy IndexTTS2 model initialization")
+            MODEL = _load_model()
+            LOGGER.info(
+                "Lazy IndexTTS2 model initialization completed in %.1f seconds",
+                time.monotonic() - started,
+            )
+        return MODEL
 
 
 def _require_object(value: Any, name: str) -> dict[str, Any]:
@@ -364,7 +557,9 @@ def _validate_public_ip(value: str) -> None:
     try:
         address = ipaddress.ip_address(value.split("%", 1)[0])
     except ValueError as exc:
-        raise RequestValidationError("Audio URL resolved to an invalid address") from exc
+        raise RequestValidationError(
+            "Audio URL resolved to an invalid address"
+        ) from exc
     if not address.is_global:
         raise RequestValidationError("Audio URL must resolve only to public addresses")
 
@@ -515,7 +710,9 @@ def _download_audio(url: str, destination: Path) -> None:
                         break
                     total += len(chunk)
                     if total > MAX_AUDIO_BYTES:
-                        raise RequestValidationError("Audio file exceeds the size limit")
+                        raise RequestValidationError(
+                            "Audio file exceeds the size limit"
+                        )
                     output.write(chunk)
             if total == 0:
                 raise RequestValidationError("Audio file is empty")
@@ -618,7 +815,9 @@ def _validate_emotion_vector(value: Any) -> list[float] | None:
     result: list[float] = []
     for item in value:
         if isinstance(item, bool) or not isinstance(item, (int, float)):
-            raise RequestValidationError("emotion_vector must contain exactly 8 numbers")
+            raise RequestValidationError(
+                "emotion_vector must contain exactly 8 numbers"
+            )
         number = float(item)
         if not math.isfinite(number) or not 0.0 <= number <= 1.0:
             raise RequestValidationError(
@@ -712,20 +911,20 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             speaker_path = _materialize_audio(request, "speaker", temp_dir)
             emotion_path = _materialize_audio(request, "emotion", temp_dir)
             if emotion_path is not None and (
-                options["emotion_vector"] is not None
-                or options["use_text_emotion"]
+                options["emotion_vector"] is not None or options["use_text_emotion"]
             ):
                 raise RequestValidationError(
                     "Emotion audio cannot be combined with vector or text emotion control"
                 )
             output_path = temp_dir / "output.wav"
+            model = get_model()
 
             with INFERENCE_LOCK, torch.inference_mode():
                 _seed_everything(effective_seed)
                 # spk_audio_prompt is IndexTTS2's zero-shot speaker/voice reference.
                 # emo_audio_prompt, emo_vector, use_emo_text/emo_text, and emo_alpha
                 # are the emotion controls in the official IndexTTS2 API.
-                result = MODEL.infer(
+                result = model.infer(
                     spk_audio_prompt=str(speaker_path),
                     text=options["text"],
                     output_path=str(output_path),
@@ -759,4 +958,11 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
+    LOGGER.info("Validating the Runpod network volume before accepting jobs")
+    _assert_network_volume()
+    LOGGER.info("Runpod network volume mount and write test passed")
+    LOGGER.info(
+        "Starting Runpod serverless handler; model initialization is deferred "
+        "until the first job"
+    )
     runpod.serverless.start({"handler": handler})
