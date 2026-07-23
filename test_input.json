@@ -1,0 +1,11 @@
+{
+  "input": {
+    "text": "Hello. This is a test of IndexTTS2 voice cloning on Runpod.",
+    "speaker_audio_url": "https://example.com/reference.wav",
+    "speaker_audio_extension": "wav",
+    "emotion_text": "Calm, natural, and friendly",
+    "emotion_alpha": 0.6,
+    "use_random": false,
+    "seed": 42
+  }
+}

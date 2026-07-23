@@ -1,0 +1,15 @@
+.git
+.github
+.gitignore
+README.md
+LICENSE-NOTICE.md
+test_input.json
+__pycache__
+*.py[cod]
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+.venv
+.env
